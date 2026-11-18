@@ -1,7 +1,8 @@
-FROM quay.io/centos/centos:stream9
-RUN dnf -y update && \
-    rpm --setcaps shadow-utils 2>/dev/null && \
-    dnf -y install podman crun --exclude container-selinux && \
+FROM quay.io/rockylinux/rockylinux:10
+RUN dnf -y update
+# Best-effort: on Rocky 10 `rpm --setcaps` can exit non-zero; don't fail the build.
+RUN rpm --setcaps shadow-utils 2>/dev/null || true
+RUN dnf -y install podman crun --exclude container-selinux && \
     dnf clean all && \
     rm -rf /var/cache /var/log/dnf* /var/log/yum*
 RUN useradd podman; \
@@ -18,12 +19,25 @@ ADD https://raw.githubusercontent.com/containers/image_build/main/podman/podman-
 ADD https://raw.githubusercontent.com/containers/image_build/main/podman/podman-containers.conf /root/.config/containers/containers.conf
 RUN chown podman:podman -R /home/podman; \
     echo 'podman:podman' | chpasswd
-RUN chmod 644 /etc/containers/containers.conf; \
-    sed -i \
-      -e 's|^#mount_program|mount_program|g' \
-      -e '/additionalimage.*/a "/var/lib/shared",' \
-      -e 's|^mountopt[[:space:]]*=.*$|mountopt = "nodev,fsync=0"|g' \
-      /etc/containers/storage.conf
+RUN chmod 644 /etc/containers/containers.conf
+# Write a known-good storage.conf for nested (podman-in-podman) use. Editing the
+# distro default with sed produced invalid TOML on Rocky 10, which broke
+# `podman version` and therefore cephadm bootstrap.
+RUN cat > /etc/containers/storage.conf <<'EOF'
+[storage]
+driver = "overlay"
+runroot = "/run/containers/storage"
+graphroot = "/var/lib/containers/storage"
+
+[storage.options]
+additionalimagestores = [
+  "/var/lib/shared",
+]
+
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
+mountopt = "nodev,fsync=0"
+EOF
 RUN mkdir -p /var/lib/shared/overlay-images /var/lib/shared/overlay-layers /var/lib/shared/vfs-images /var/lib/shared/vfs-layers; \
     touch /var/lib/shared/overlay-images/images.lock; \
     touch /var/lib/shared/overlay-layers/layers.lock; \
@@ -31,6 +45,9 @@ RUN mkdir -p /var/lib/shared/overlay-images /var/lib/shared/overlay-layers /var/
     touch /var/lib/shared/vfs-layers/layers.lock
 ENV _CONTAINERS_USERNS_CONFIGURED=""
 
+# `which` is no longer in the Rocky 10 base repos; it ships in EPEL.
+RUN dnf -y install epel-release || \
+    rpm -ivh https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
 RUN dnf -y install \
     which \
     sudo \
@@ -38,13 +55,15 @@ RUN dnf -y install \
     openssh-server \
     hostname \
     python3-pip \
+    python3-packaging \
     httpd \
     chrony \
     hostname \
     iproute \
-    procps \
-    udev \
+    procps-ng \
+    systemd-udev \
     systemd \
+    fuse-overlayfs \
     'dnf-command(copr)' \
     lvm2 && \
     echo 'OPTIONS="-x"' > /etc/sysconfig/chronyd && \
